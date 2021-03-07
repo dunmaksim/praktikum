@@ -1,136 +1,182 @@
+#!/env/python3
+"""
+Программа для загрузки данных о фильмах из БД SQLite в ElasticSearch.
+
+
+"""
+
+import json  # loads
+import os  # getenv
+import pathlib
 import sqlite3
-import json
+import sys  # exit
 
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk
+import elasticsearch
+
+_ES_DEFAULT_HOST = '192.168.1.252'
+_ES_DEFAULT_PORT = '9200'
+_ES_HOST = os.getenv('ELASTICSEARCH_HOST', _ES_DEFAULT_HOST)
+_ES_PORT = int(os.getenv('ELASTICSEARCH_PORT', _ES_DEFAULT_PORT))
+_ES_CONFIG = dict(host=_ES_HOST, port=_ES_PORT)
+
+_SQLITE_DATABASE = 'db.sqlite'
 
 
-def extract():
+def simple_extract(cur, table_name: str) -> dict:
+    """Извлекает сущности из указанной таблицы в виде словаря.
+
+    cur -- курсор в базе SQLite.
+    table_name -- таблица, из которой нужно выбрать данные
     """
-    extract data from sql-db
-    :return:
+    query = "SELECT id, name FROM {} WHERE name != 'N/A';".format(table_name)
+    data = cur.execute(query)
+    result_dict = {}
+    for d in data:
+        result_dict[d[0]] = d[1]
+    return result_dict
+
+
+def extract_actors(cur) -> dict:
+    """Извлекает из базы словарь актёров."""
+    return simple_extract(cur, "actors")
+
+
+def extract_writers(cur) -> dict:
     """
-    connection = sqlite3.connect("db.sqlite")
-    cursor = connection.cursor()
-
-    # Наверняка это пилится в один sql - запрос, но мне как-то лениво)
-
-    # Получаем все поля для индекса, кроме списка актеров и сценаристов, для них только id
-    cursor.execute("""
-        select id, imdb_rating, genre, title, plot, director,
-        -- comma-separated actor_id's
-        (
-            select GROUP_CONCAT(actor_id) from
-            (
-                select actor_id
-                from movie_actors
-                where movie_id = movies.id
-            )
-        ),
-
-        max(writer, writers)
-        from movies
-    """)
-
-    raw_data = cursor.fetchall()
-
-    # cursor.execute('pragma table_info(movies)')
-    # pprint(cursor.fetchall())
-
-    # Нужны для соответсвия идентификатора и человекочитаемого названия
-    actors = {
-        row[0]: row[1]
-        for row in cursor.execute('select * from actors where name != "N/A"')
-    }
-    writers = {
-        row[0]: row[1]
-        for row in cursor.execute('select * from writers where name != "N/A"')
-    }
-
-    return actors, writers, raw_data
+    Извлекает из базы словарь сценаристов.
+    """
+    return simple_extract(cur, "writers")
 
 
-def transform(__actors, __writers, __raw_data):
+def extract_movies_actors(cur) -> dict:
+    """
+    Извлекает словарь, где id каждого фильма соответствует список id актёров.
     """
 
-    :param __actors:
-    :param __writers:
-    :param __raw_data:
-    :return:
-    """
-    documents_list = []
-    for movie_info in __raw_data:
-        # Разыменование списка
-        movie_id, imdb_rating, genre, title, description, director, raw_actors, raw_writers = movie_info
+    query = "SELECT movie_id, actor_id FROM movie_actors;"
+    movies_actors = {}
+    for row in cur.execute(query):
+        movie_id = row[0]  # id фильма
+        if movie_id in movies_actors:  # Такой фильм есть? Добавим актёра.
+            movies_actors[movie_id].append(row[1])
+        else:  # Фильма ещё нет в списке? Добавим словарь из одного элемента
+            movies_actors[movie_id] = [
+                row[1],
+            ]
+    return movies_actors
 
-        if raw_writers[0] == '[':
-            parsed = json.loads(raw_writers)
-            new_writers = ','.join([writer_row['id'] for writer_row in parsed])
-        else:
-            new_writers = raw_writers
 
-        writers_list = [(writer_id, __writers.get(writer_id))
-                        for writer_id in new_writers.split(',')]
-        actors_list = [(actor_id, __actors.get(int(actor_id)))
-                       for actor_id in raw_actors.split(',')]
+def extract_movies(cur, actors, writers, movies_actors) -> list:
+    u"""Извлекает из базы информацию о фильмах."""
 
-        document = {
-            "_index":
-            "movies",
-            "_id":
-            movie_id,
-            "id":
-            movie_id,
-            "imdb_rating":
-            imdb_rating,
-            "genre":
-            genre.split(', '),
-            "title":
-            title,
-            "description":
-            description,
-            "director":
-            director,
-            "actors": [{
-                "id": actor[0],
-                "name": actor[1]
-            } for actor in set(actors_list) if actor[1]],
-            "writers": [{
-                "id": writer[0],
-                "name": writer[1]
-            } for writer in set(writers_list) if writer[1]]
+    query = """SELECT id,
+                      genre,
+                      director,
+                      title,
+                      plot,
+                      imdb_rating,
+                      writer,
+                      writers
+               FROM movies;"""
+
+    raw_movies = cur.execute(query)
+    movies = []
+    for raw_movie in raw_movies:
+        movie = {
+            "id": raw_movie[0],
+            "genre": raw_movie[1],
+            "director": raw_movie[2],
+            "title": raw_movie[3],
+            "desctiption": raw_movie[4],  # plot
+            "imdb_rating": raw_movie[5],
+            "actors": [],
+            "writers": []
         }
 
-        for key in document.keys():
-            if document[key] == 'N/A':
-                # print('hehe')
-                document[key] = None
+        # Для полей writers_names и actors_names
+        actors_names = []
+        writers_names = []
 
-        document['actors_names'] = ", ".join(
-            [actor["name"] for actor in document['actors'] if actor]) or None
-        document['writers_names'] = ", ".join(
-            [writer["name"]
-             for writer in document['writers'] if writer]) or None
+        # Работа со сценаристами
+        writer_id = raw_movie[6]  # writer
+        # Не равно Null? Значит, только один сценарист
+        if writer_id is not None and writer_id != "":
+            if writer_id in writers:
+                writer_name = writers[writer_id]
+                movie["writers"].append({"id": writer_id, "name": writer_name})
+                writers_names.append(writer_name)
 
-        import pprint
-        pprint.pprint(document)
+        else:
+            # Строка с ID сценаристов
+            # Убираем [ и ] в начале и конце строки, потом делим на части
+            writers_str = raw_movie[7][1:-1].split(",")
+            # Каждую часть превращаем в словарь
+            for writer_raw in writers_str:
+                writer_dict = json.loads(writer_raw)
+                # Находим нужного сценариста, добавляем в список
+                writer_id = writer_dict["id"]
+                if writer_id in writers:
+                    writer_name = writers[writer_id]
+                    movie["writers"].append({
+                        "id": writer_id,
+                        "name": writer_name
+                    })
+                    writers_names.append(writer_name)
 
-        documents_list.append(document)
+        # Работа с актёрами
+        actors_ids = map(int, movies_actors[movie["id"]])  # список id актёров
 
-    return documents_list
+        # Добавляем в поле "actors" актёров из словаря
+        for actor_id in actors_ids:
+            if actor_id in actors:
+                actor_name = actors[actor_id]
+                movie["actors"].append({"id": actor_id, "name": actor_name})
+                actors_names.append(actor_name)
+
+        # Теперь нужно заполнить поля "writers_names" и "actors_names"
+        movie["writers_names"] = ", ".join(writers_names)
+        movie["actors_names"] = ", ".join(actors_names)
+        movies.append(movie)
+    return movies
 
 
-def load(acts):
+def main() -> int:
+    u"""
+    Основная функция приложения.
+    Алгоритм работы:
+    1. Подключиться к SQLite.
+    2. Подключиться к ElasticSearch.
+    3. Если подключение прошло успешно, извлечь данные из SQLite.
+    4. Сформировать массив данных и загрузить в ElasticSearch.
+    5. Закрыть подключения.
     """
 
-    :param acts:
-    :return:
-    """
-    es = Elasticsearch([{'host': '192.168.1.252', 'port': 9200}])
-    bulk(es, acts)
+    sqlite_connection = None
+    sqlite_cursor = None
 
-    return True
+    sqlite_db = pathlib.Path(_SQLITE_DATABASE)
+    if sqlite_db.exists() and sqlite_db.is_file():
+        try:
+            sqlite_connection = sqlite3.connect(_SQLITE_DATABASE)
+            sqlite_cursor = sqlite_connection.cursor()
+        except:
+            sys.exit("SQLite database not found.")
+
+    es_connection = elasticsearch.Elasticsearch([_ES_CONFIG])
+
+    if es_connection.ping():
+        actors = extract_actors(sqlite_cursor)
+        writers = extract_writers(sqlite_cursor)
+        movies_actors = extract_movies_actors(sqlite_cursor)
+        movies = extract_movies(sqlite_cursor, actors, writers, movies_actors)
+        elasticsearch.helpers.bulk(es_connection, movies)
+    else:
+        print("ElasticSearch host {} is not available.".format(_ES_HOST))
+
+    es_connection.close()
+    sqlite_connection.close()
+    return 0
 
 
 if __name__ == '__main__':
-    load(transform(*extract()))
+    sys.exit(main())
