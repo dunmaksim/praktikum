@@ -91,7 +91,7 @@ def extract_movies(cur, actors, writers, movies_actors) -> list:
             "imdb_rating": raw_movie[5],
             "actors": [],
             "writers": []
-        }
+    }
 
         # Для полей writers_names и actors_names
         actors_names = []
